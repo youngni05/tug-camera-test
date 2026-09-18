@@ -151,6 +151,7 @@
     <div class="stage-overlay">
       <div class="badge-row">
         <div class="badge" id="poseStatus">Pose: 대기중</div>
+        <div class="badge" id="lowerBodyBadge">하체: --%</div>
         <div class="badge" id="fpsStatus">-- fps</div>
       </div>
       <div class="timer-display">
@@ -193,8 +194,24 @@
     <div class="metric-grid" id="metricGrid">
       <div class="metric"><div class="k">TUG 총 시간</div><div class="v" id="mTotal">--<small>s</small></div></div>
       <div class="metric"><div class="k">기록된 프레임 수</div><div class="v" id="mFrames">--</div></div>
-      <div class="metric"><div class="k">평균 검출 신뢰도</div><div class="v" id="mConf">--</div></div>
+      <div class="metric"><div class="k">평균 검출 신뢰도 (전체 33점)</div><div class="v" id="mConf">--</div></div>
       <div class="metric"><div class="k">평균 FPS</div><div class="v" id="mFps">--</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>하체 관절 신뢰도 (보행지표 핵심 관절)</h2>
+    <div class="metric-grid" id="lowerBodyMetricGrid">
+      <div class="metric"><div class="k">하체 평균 신뢰도</div><div class="v" id="mLowerAvg">--</div></div>
+      <div class="metric"><div class="k">세션 중 최저값</div><div class="v" id="mLowerMin">--</div></div>
+      <div class="metric"><div class="k">저신뢰 프레임 비율 (&lt;50%)</div><div class="v" id="mLowerLowRatio">--</div></div>
+      <div class="metric"><div class="k">최저값 발생 시점</div><div class="v" id="mLowerMinT">--<small>s</small></div></div>
+    </div>
+    <div class="metric-grid" id="jointBreakdownGrid" style="margin-top:10px;">
+      <div class="metric"><div class="k">엉덩이 (23·24)</div><div class="v" id="mJointHip">--</div></div>
+      <div class="metric"><div class="k">무릎 (25·26)</div><div class="v" id="mJointKnee">--</div></div>
+      <div class="metric"><div class="k">발목 (27·28)</div><div class="v" id="mJointAnkle">--</div></div>
+      <div class="metric"><div class="k">발뒤꿈치·발끝 (29~32)</div><div class="v" id="mJointFoot">--</div></div>
     </div>
   </div>
 
@@ -245,8 +262,33 @@
   const mConf = document.getElementById('mConf');
   const mFps = document.getElementById('mFps');
 
+  const lowerBodyBadge = document.getElementById('lowerBodyBadge');
+  const mLowerAvg = document.getElementById('mLowerAvg');
+  const mLowerMin = document.getElementById('mLowerMin');
+  const mLowerLowRatio = document.getElementById('mLowerLowRatio');
+  const mLowerMinT = document.getElementById('mLowerMinT');
+  const mJointHip = document.getElementById('mJointHip');
+  const mJointKnee = document.getElementById('mJointKnee');
+  const mJointAnkle = document.getElementById('mJointAnkle');
+  const mJointFoot = document.getElementById('mJointFoot');
+
   const calibDistanceInput = document.getElementById('calibDistance');
   const calibPixelsInput = document.getElementById('calibPixels');
+
+  // TUG 보행지표 계산에 쓰이는 하체 랜드마크 (MediaPipe Pose 33점 기준)
+  const LOWER_BODY_INDICES = [23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
+  const JOINT_GROUPS = {
+    hip: [23, 24],
+    knee: [25, 26],
+    ankle: [27, 28],
+    foot: [29, 30, 31, 32] // 발뒤꿈치 + 발끝
+  };
+  const LOW_CONF_THRESHOLD = 0.5; // MediaPipe 기본 검출 임계값과 동일 선상
+
+  function avgVisibility(landmarks, indices) {
+    const vals = indices.map(i => landmarks[i]?.visibility || 0);
+    return vals.reduce((a, b) => a + b, 0) / vals.length;
+  }
 
   let facingMode = 'environment'; // 후면 기본
   let stream = null;
@@ -348,27 +390,102 @@
         drawLandmarks(ctx, results.poseLandmarks, { color: '#e8efe9', radius: 2.5, lineWidth: 1 });
       }
 
+      // 카메라만 켜져 있어도(녹화 전이라도) 하체 신뢰도를 실시간으로 보여줘서
+      // 촬영 구도를 잡는 단계에서 바로 확인 가능하게 함
+      const liveLowerAvg = avgVisibility(results.poseLandmarks, LOWER_BODY_INDICES);
+      lowerBodyBadge.textContent = `하체: ${(liveLowerAvg * 100).toFixed(0)}%`;
+      lowerBodyBadge.classList.toggle('ok', liveLowerAvg >= LOW_CONF_THRESHOLD);
+      lowerBodyBadge.classList.toggle('no', liveLowerAvg < LOW_CONF_THRESHOLD);
+
       if (recording) {
         const visSum = results.poseLandmarks.reduce((s, p) => s + (p.visibility || 0), 0);
         const visAvg = visSum / results.poseLandmarks.length;
+        const lowerVisAvg = liveLowerAvg;
+        const jointAvg = {
+          hip: avgVisibility(results.poseLandmarks, JOINT_GROUPS.hip),
+          knee: avgVisibility(results.poseLandmarks, JOINT_GROUPS.knee),
+          ankle: avgVisibility(results.poseLandmarks, JOINT_GROUPS.ankle),
+          foot: avgVisibility(results.poseLandmarks, JOINT_GROUPS.foot)
+        };
         frames.push({
           t: (now - recordStartTs) / 1000,
           landmarks: results.poseLandmarks.map(p => ({ x: p.x, y: p.y, z: p.z, v: +p.visibility.toFixed(3) })),
           worldLandmarks: results.poseWorldLandmarks
             ? results.poseWorldLandmarks.map(p => ({ x: p.x, y: p.y, z: p.z }))
             : null,
-          visAvg: +visAvg.toFixed(3)
+          visAvg: +visAvg.toFixed(3),
+          lowerVisAvg: +lowerVisAvg.toFixed(3),
+          jointAvg: {
+            hip: +jointAvg.hip.toFixed(3),
+            knee: +jointAvg.knee.toFixed(3),
+            ankle: +jointAvg.ankle.toFixed(3),
+            foot: +jointAvg.foot.toFixed(3)
+          }
         });
         mFrames.textContent = frames.length;
         const confAvg = frames.reduce((s, f) => s + f.visAvg, 0) / frames.length;
         mConf.textContent = (confAvg * 100).toFixed(0) + '%';
         mFps.textContent = avgFps.toFixed(0);
+
+        updateLowerBodySummary();
       }
     } else {
       poseStatus.textContent = 'Pose: 미검출';
       poseStatus.classList.remove('ok');
       poseStatus.classList.add('no');
     }
+  }
+
+  function updateLowerBodySummary() {
+    if (frames.length === 0) return;
+
+    const lowerVals = frames.map(f => f.lowerVisAvg);
+    const lowerAvg = lowerVals.reduce((a, b) => a + b, 0) / lowerVals.length;
+
+    let minVal = lowerVals[0];
+    let minT = frames[0].t;
+    frames.forEach(f => {
+      if (f.lowerVisAvg < minVal) { minVal = f.lowerVisAvg; minT = f.t; }
+    });
+
+    const lowCount = lowerVals.filter(v => v < LOW_CONF_THRESHOLD).length;
+    const lowRatio = lowCount / lowerVals.length;
+
+    const jointAvgs = { hip: 0, knee: 0, ankle: 0, foot: 0 };
+    frames.forEach(f => {
+      jointAvgs.hip += f.jointAvg.hip;
+      jointAvgs.knee += f.jointAvg.knee;
+      jointAvgs.ankle += f.jointAvg.ankle;
+      jointAvgs.foot += f.jointAvg.foot;
+    });
+    Object.keys(jointAvgs).forEach(k => { jointAvgs[k] /= frames.length; });
+
+    mLowerAvg.textContent = (lowerAvg * 100).toFixed(0) + '%';
+    mLowerAvg.style.color = lowerAvg >= LOW_CONF_THRESHOLD ? 'var(--accent)' : 'var(--danger)';
+
+    mLowerMin.textContent = (minVal * 100).toFixed(0) + '%';
+    mLowerMin.style.color = minVal >= LOW_CONF_THRESHOLD ? 'var(--text)' : 'var(--danger)';
+
+    mLowerLowRatio.textContent = (lowRatio * 100).toFixed(0) + '%';
+    mLowerLowRatio.style.color = lowRatio > 0.1 ? 'var(--warn)' : 'var(--text)';
+
+    mLowerMinT.innerHTML = minT.toFixed(2) + '<small>s</small>';
+
+    mJointHip.textContent = (jointAvgs.hip * 100).toFixed(0) + '%';
+    mJointKnee.textContent = (jointAvgs.knee * 100).toFixed(0) + '%';
+    mJointAnkle.textContent = (jointAvgs.ankle * 100).toFixed(0) + '%';
+    mJointFoot.textContent = (jointAvgs.foot * 100).toFixed(0) + '%';
+  }
+
+  function resetLowerBodySummary() {
+    mLowerAvg.textContent = '--'; mLowerAvg.style.color = '';
+    mLowerMin.textContent = '--'; mLowerMin.style.color = '';
+    mLowerLowRatio.textContent = '--'; mLowerLowRatio.style.color = '';
+    mLowerMinT.innerHTML = '--<small>s</small>';
+    mJointHip.textContent = '--';
+    mJointKnee.textContent = '--';
+    mJointAnkle.textContent = '--';
+    mJointFoot.textContent = '--';
   }
 
   function fmtTime(sec) {
@@ -403,6 +520,7 @@
     mTotal.innerHTML = '--<small>s</small>';
     mFrames.textContent = '0';
     mConf.textContent = '--';
+    resetLowerBodySummary();
     startTimer();
     log('TUG 측정 시작');
   });
@@ -416,6 +534,11 @@
     tugStartBtn.disabled = false;
     exportBtn.disabled = frames.length === 0;
     log(`TUG 측정 종료. 총 ${total.toFixed(2)}초, ${frames.length}프레임 기록됨`);
+    if (frames.length > 0) {
+      const lowerAvg = frames.reduce((s, f) => s + f.lowerVisAvg, 0) / frames.length;
+      const lowCount = frames.filter(f => f.lowerVisAvg < LOW_CONF_THRESHOLD).length;
+      log(`하체 관절 평균 신뢰도: ${(lowerAvg * 100).toFixed(0)}%, 저신뢰 프레임: ${lowCount}/${frames.length} (${((lowCount/frames.length)*100).toFixed(0)}%)`);
+    }
   });
 
   resetBtn.addEventListener('click', () => {
@@ -427,6 +550,9 @@
     mFrames.textContent = '--';
     mConf.textContent = '--';
     mFps.textContent = '--';
+    resetLowerBodySummary();
+    lowerBodyBadge.textContent = '하체: --%';
+    lowerBodyBadge.classList.remove('ok', 'no');
     tugStartBtn.disabled = false;
     tugStopBtn.disabled = true;
     exportBtn.disabled = true;
@@ -438,6 +564,33 @@
   });
 
   exportBtn.addEventListener('click', () => {
+    let lowerBodySummary = null;
+    if (frames.length > 0) {
+      const lowerVals = frames.map(f => f.lowerVisAvg);
+      const lowerAvg = lowerVals.reduce((a, b) => a + b, 0) / lowerVals.length;
+      let minVal = lowerVals[0], minT = frames[0].t;
+      frames.forEach(f => { if (f.lowerVisAvg < minVal) { minVal = f.lowerVisAvg; minT = f.t; } });
+      const lowCount = lowerVals.filter(v => v < LOW_CONF_THRESHOLD).length;
+      const jointAvgs = { hip: 0, knee: 0, ankle: 0, foot: 0 };
+      frames.forEach(f => {
+        jointAvgs.hip += f.jointAvg.hip;
+        jointAvgs.knee += f.jointAvg.knee;
+        jointAvgs.ankle += f.jointAvg.ankle;
+        jointAvgs.foot += f.jointAvg.foot;
+      });
+      Object.keys(jointAvgs).forEach(k => { jointAvgs[k] = +(jointAvgs[k] / frames.length).toFixed(3); });
+
+      lowerBodySummary = {
+        avgVisibility: +lowerAvg.toFixed(3),
+        minVisibility: +minVal.toFixed(3),
+        minVisibilityAtSec: +minT.toFixed(2),
+        lowConfidenceThreshold: LOW_CONF_THRESHOLD,
+        lowConfidenceFrameRatio: +(lowCount / frames.length).toFixed(3),
+        jointGroupAvg: jointAvgs,
+        note: "hip=23·24, knee=25·26, ankle=27·28, foot(heel+toe)=29~32 (MediaPipe Pose 인덱스)"
+      };
+    }
+
     const session = {
       meta: {
         recordedAt: new Date().toISOString(),
@@ -445,6 +598,7 @@
         calibPixels: parseFloat(calibPixelsInput.value) || null,
         totalTimeSec: frames.length ? frames[frames.length - 1].t : 0,
         frameCount: frames.length,
+        lowerBodyConfidence: lowerBodySummary,
         note: "landmarks는 MediaPipe Pose 정규화 좌표(0~1), worldLandmarks는 미터 단위 상대좌표"
       },
       frames
