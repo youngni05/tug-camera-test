@@ -176,8 +176,11 @@
       <input type="number" id="calibDistance" value="2.4" step="0.1" min="0.5" />
     </div>
     <div class="field">
-      <label>화면 상 기준선 길이 (px, 자동측정 예정 시 무시)</label>
+      <label>화면 상 기준선 길이 (영상 px, 기준선 지정 시 자동 입력)</label>
       <input type="number" id="calibPixels" value="0" step="1" min="0" />
+    </div>
+    <div class="row">
+      <button class="ghost small" id="calibLineBtn" disabled>기준선 지정 (2.4m 구간 양 끝을 화면에서 탭)</button>
     </div>
 
     <div class="row">
@@ -196,6 +199,22 @@
       <div class="metric"><div class="k">기록된 프레임 수</div><div class="v" id="mFrames">--</div></div>
       <div class="metric"><div class="k">평균 검출 신뢰도 (전체 33점)</div><div class="v" id="mConf">--</div></div>
       <div class="metric"><div class="k">평균 FPS</div><div class="v" id="mFps">--</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>보행 지표 (무릎 각도 · 좌우 흔들림 · 보폭)</h2>
+    <div class="metric-grid">
+      <div class="metric"><div class="k">무릎 굴곡 현재 (좌 / 우)</div><div class="v" id="mKneeNow">--</div></div>
+      <div class="metric"><div class="k">무릎 굴곡 최대 (좌 / 우)</div><div class="v" id="mKneeMax">--</div></div>
+      <div class="metric"><div class="k">몸통 좌우 기울기 (SD / 최대)</div><div class="v" id="mTilt">--</div></div>
+      <div class="metric"><div class="k">골반 좌우 흔들림 (몸통길이 대비)</div><div class="v" id="mSway">--</div></div>
+      <div class="metric"><div class="k">걸음 수 (검출)</div><div class="v" id="mSteps">--</div></div>
+      <div class="metric"><div class="k">평균 보폭 step (추정 / 기준선 보정)</div><div class="v" id="mStep">--</div></div>
+      <div class="metric"><div class="k">평균 스트라이드 (추정 / 기준선 보정)</div><div class="v" id="mStride">--</div></div>
+      <div class="metric"><div class="k">보폭 변동 (SD, 추정 기준)</div><div class="v" id="mStepSd">--</div></div>
+      <div class="metric"><div class="k">보행 구간 길이 (일어서기·턴 제외)</div><div class="v" id="mWalkSec">--</div></div>
+      <div class="metric"><div class="k">보행 구간 이동거리 (보정, 측면)</div><div class="v" id="mWalkDist">--</div></div>
     </div>
   </div>
 
@@ -262,6 +281,18 @@
   const mConf = document.getElementById('mConf');
   const mFps = document.getElementById('mFps');
 
+  const mKneeNow = document.getElementById('mKneeNow');
+  const mKneeMax = document.getElementById('mKneeMax');
+  const mTilt = document.getElementById('mTilt');
+  const mSway = document.getElementById('mSway');
+  const mSteps = document.getElementById('mSteps');
+  const mStep = document.getElementById('mStep');
+  const mStride = document.getElementById('mStride');
+  const mStepSd = document.getElementById('mStepSd');
+  const mWalkSec = document.getElementById('mWalkSec');
+  const mWalkDist = document.getElementById('mWalkDist');
+  const calibLineBtn = document.getElementById('calibLineBtn');
+  const stageEl = document.getElementById('stage');
   const lowerBodyBadge = document.getElementById('lowerBodyBadge');
   const mLowerAvg = document.getElementById('mLowerAvg');
   const mLowerMin = document.getElementById('mLowerMin');
@@ -308,6 +339,236 @@
     logBox.textContent = `[${t}] ${msg}\n` + logBox.textContent;
   }
 
+  // ---- 보행 지표 계산 ----
+  // MediaPipe 인덱스: 11/12 어깨, 23/24 엉덩이, 25/26 무릎, 27/28 발목 (좌/우)
+  const VIS_MIN = 0.5;
+  const mean = (a) => a.reduce((s, x) => s + x, 0) / a.length;
+  const sd = (a) => { const m = mean(a); return Math.sqrt(mean(a.map(x => (x - m) ** 2))); };
+
+  // 무릎 굴곡각: 0° = 완전 신전(펴짐), 값이 클수록 많이 굽힘. 3D world 좌표라 촬영 각도 영향이 적음.
+  function kneeFlexion(w, hip, knee, ankle) {
+    const a = [w[hip].x - w[knee].x, w[hip].y - w[knee].y, w[hip].z - w[knee].z];
+    const b = [w[ankle].x - w[knee].x, w[ankle].y - w[knee].y, w[ankle].z - w[knee].z];
+    const dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const cos = dot / (Math.hypot(...a) * Math.hypot(...b));
+    return 180 - Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
+  }
+
+  const visOk = (lm, ...idx) => idx.every(i => (lm[i].visibility || 0) >= VIS_MIN);
+
+  function frameMetrics(lm, wlm) {
+    const m = { kneeL: null, kneeR: null, trunkTilt: null, pelvisX: null, torsoLen: null, ankleSep: null, ankleDx: null };
+    if (wlm) {
+      if (visOk(lm, 23, 25, 27)) m.kneeL = +kneeFlexion(wlm, 23, 25, 27).toFixed(1);
+      if (visOk(lm, 24, 26, 28)) m.kneeR = +kneeFlexion(wlm, 24, 26, 28).toFixed(1);
+      // 좌우 발목 간격(수평면 거리, m): 걸음마다 최대가 되는 순간 = step length
+      if (visOk(lm, 27, 28)) {
+        m.ankleSep = +Math.hypot(wlm[27].x - wlm[28].x, wlm[27].z - wlm[28].z).toFixed(3);
+        m.ankleDx = +(lm[27].x - lm[28].x).toFixed(4); // 화면상 좌우 발목 x 차이(정규화) — 기준선 보정용
+      }
+    }
+    if (visOk(lm, 11, 12, 23, 24)) {
+      const shx = (lm[11].x + lm[12].x) / 2, shy = (lm[11].y + lm[12].y) / 2;
+      const hpx = (lm[23].x + lm[24].x) / 2, hpy = (lm[23].y + lm[24].y) / 2;
+      // 어깨중점→골반중점 벡터가 수직에서 벗어난 각도 (화면 평면, 정면/후면 촬영 시 좌우 기울기)
+      m.trunkTilt = +(Math.atan2(shx - hpx, hpy - shy) * 180 / Math.PI).toFixed(2);
+      m.pelvisX = +hpx.toFixed(4);
+      m.torsoLen = +Math.hypot(shx - hpx, shy - hpy).toFixed(4);
+    }
+    return m;
+  }
+
+  // 걷는 구간 판별: 골반이 화면에서 빠르게 이동(측면 촬영)하거나 몸통 크기가 빠르게 변할 때(정면/후면 촬영) = 보행.
+  // 일어서기·턴·착석은 골반 이동이 거의 없어 제외됨. 임계값은 실측 데이터로 조정 필요.
+  const WALK_LATERAL_TORSO_PER_S = 0.4;
+  const WALK_DEPTH_RATE_PER_S = 0.12;
+  const WALK_MIN_TOTAL_SEC = 1.0;
+
+  function markWalking(fr) {
+    fr.forEach(f => { f.walking = false; });
+    const pts = fr.filter(f => f.pelvisX != null);
+    let lo = 0, hi = 0, walkSec = 0;
+    for (let i = 0; i < pts.length; i++) {
+      while (pts[i].t - pts[lo].t > 0.5) lo++;
+      hi = Math.max(hi, i);
+      while (hi + 1 < pts.length && pts[hi + 1].t - pts[i].t <= 0.5) hi++;
+      const dt = pts[hi].t - pts[lo].t;
+      if (dt < 0.3) continue;
+      const lateral = Math.abs(pts[hi].pelvisX - pts[lo].pelvisX) / dt / pts[i].torsoLen;
+      const depth = Math.abs(pts[hi].torsoLen - pts[lo].torsoLen) / dt / pts[i].torsoLen;
+      pts[i].walking = lateral > WALK_LATERAL_TORSO_PER_S || depth > WALK_DEPTH_RATE_PER_S;
+      if (pts[i].walking && i > 0) walkSec += Math.min(pts[i].t - pts[i - 1].t, 0.2);
+    }
+    return walkSec;
+  }
+
+  // cal: { vw, vh, mPerPx } 또는 null. 보정값은 카메라가 보행선과 수직인 측면 촬영에서만 의미 있음.
+  function computeSummary(fr, cal) {
+    const s = { walkFilterApplied: false, walkSec: 0, walkDistanceCalibM: null, knee: {},
+                trunkTiltSdDeg: null, trunkTiltMaxAbsDeg: null, pelvisSwayPctTorso: null,
+                stepCount: 0, meanStepM: null, meanStrideM: null, stepSdM: null,
+                meanStepCalibM: null, meanStrideCalibM: null, scaleRatioCalibOverWorld: null,
+                stepTimesSec: [], stepLengthsM: [], stepLengthsCalibM: [] };
+
+    s.walkSec = +markWalking(fr).toFixed(2);
+    s.walkFilterApplied = s.walkSec >= WALK_MIN_TOTAL_SEC; // 보행 구간이 너무 짧으면 필터 없이 전체 사용
+    const use = s.walkFilterApplied ? fr.filter(f => f.walking) : fr;
+
+    for (const [side, key] of [['left', 'kneeL'], ['right', 'kneeR']]) {
+      const v = use.map(f => f[key]).filter(x => x != null);
+      const all = fr.map(f => f[key]).filter(x => x != null);
+      s.knee[side] = v.length ? {
+        maxFlexionDeg: Math.max(...v), minFlexionDeg: Math.min(...v), rangeDeg: Math.max(...v) - Math.min(...v),
+        maxFlexionAllDeg: Math.max(...all) // 일어서기·착석 포함 전체 구간
+      } : null;
+    }
+
+    const tilt = use.map(f => f.trunkTilt).filter(x => x != null);
+    if (tilt.length > 2) {
+      s.trunkTiltSdDeg = +sd(tilt).toFixed(2);
+      s.trunkTiltMaxAbsDeg = +Math.max(...tilt.map(Math.abs)).toFixed(2);
+    }
+
+    // 골반 x 좌표: 보행 구간(연속 구간)마다 선형 추세(걷는 방향 이동)를 빼고 잔차를 몸통 길이 단위로 모아 SD 계산
+    const runs = [];
+    if (s.walkFilterApplied) {
+      let cur = [];
+      for (const f of fr) {
+        if (f.walking) cur.push(f);
+        else if (cur.length) { runs.push(cur); cur = []; }
+      }
+      if (cur.length) runs.push(cur);
+    } else {
+      runs.push(fr);
+    }
+    const resid = [];
+    for (const run of runs) {
+      const p = run.filter(f => f.pelvisX != null);
+      if (p.length < 6) continue;
+      const mt = mean(p.map(f => f.t)), mx = mean(p.map(f => f.pelvisX)), torso = mean(p.map(f => f.torsoLen));
+      let num = 0, den = 0;
+      p.forEach(f => { num += (f.t - mt) * (f.pelvisX - mx); den += (f.t - mt) ** 2; });
+      const slope = den ? num / den : 0;
+      p.forEach(f => resid.push((f.pelvisX - (mx + slope * (f.t - mt))) / torso));
+    }
+    if (resid.length > 5) s.pelvisSwayPctTorso = +(sd(resid) * 100).toFixed(1);
+
+    // 걸음 검출: 발목 간격의 국소 최대(±0.25초 이내 최대, 0.15m 이상), 보행 구간 안의 것만 채택
+    const sep = fr.filter(f => f.ankleSep != null);
+    let peaks = [];
+    for (let i = 0; i < sep.length; i++) {
+      if (sep[i].ankleSep < 0.15) continue;
+      let isPeak = true;
+      for (let j = i - 1; j >= 0 && sep[i].t - sep[j].t <= 0.25; j--) if (sep[j].ankleSep > sep[i].ankleSep) { isPeak = false; break; }
+      for (let j = i + 1; isPeak && j < sep.length && sep[j].t - sep[i].t <= 0.25; j++) if (sep[j].ankleSep >= sep[i].ankleSep) isPeak = false;
+      if (isPeak) peaks.push(sep[i]);
+    }
+    if (s.walkFilterApplied) peaks = peaks.filter(p => p.walking);
+
+    s.stepCount = peaks.length;
+    s.stepTimesSec = peaks.map(p => +p.t.toFixed(2));
+    s.stepLengthsM = peaks.map(p => p.ankleSep);
+    if (peaks.length) {
+      s.meanStepM = +mean(s.stepLengthsM).toFixed(3);
+      s.stepSdM = peaks.length > 1 ? +sd(s.stepLengthsM).toFixed(3) : null;
+    }
+    if (peaks.length > 1) {
+      s.meanStrideM = +mean(s.stepLengthsM.slice(1).map((v, i) => v + s.stepLengthsM[i])).toFixed(3); // 연속 두 걸음 합
+    }
+
+    // 기준선 보정: 화면상 발목 x 간격(영상 px) × (실측 m / 기준선 px). 측면 촬영 전용.
+    if (cal) {
+      s.stepLengthsCalibM = peaks.map(p => +(Math.abs(p.ankleDx) * cal.vw * cal.mPerPx).toFixed(3));
+      if (peaks.length) {
+        s.meanStepCalibM = +mean(s.stepLengthsCalibM).toFixed(3);
+        if (s.meanStepM) s.scaleRatioCalibOverWorld = +(s.meanStepCalibM / s.meanStepM).toFixed(2);
+      }
+      if (peaks.length > 1) {
+        s.meanStrideCalibM = +mean(s.stepLengthsCalibM.slice(1).map((v, i) => v + s.stepLengthsCalibM[i])).toFixed(3);
+      }
+      if (s.walkFilterApplied) {
+        const pts = fr.filter(f => f.pelvisX != null);
+        let distPx = 0;
+        for (let i = 1; i < pts.length; i++) {
+          if (pts[i].walking && pts[i - 1].walking) distPx += Math.abs(pts[i].pelvisX - pts[i - 1].pelvisX) * cal.vw;
+        }
+        s.walkDistanceCalibM = +(distPx * cal.mPerPx).toFixed(2);
+      }
+    }
+    return s;
+  }
+
+  // ---- 기준선 보정 (화면에서 2.4m 구간 양 끝 두 점을 탭) ----
+  let calibPts = [];       // 영상 프레임 기준 정규화 좌표 {nx, ny}
+  let calibrating = false;
+
+  // object-fit: cover 로 잘리는 영역까지 고려한 화면↔영상 좌표 변환용 기하
+  function coverGeometry() {
+    const rect = stageEl.getBoundingClientRect();
+    const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+    const k = Math.max(rect.width / vw, rect.height / vh);
+    const dw = vw * k, dh = vh * k;
+    return { rect, vw, vh, dw, dh, ox: (dw - rect.width) / 2, oy: (dh - rect.height) / 2 };
+  }
+
+  function getCalibration() {
+    const d = parseFloat(calibDistanceInput.value), px = parseFloat(calibPixelsInput.value);
+    if (!(d > 0 && px > 0 && videoEl.videoWidth)) return null;
+    return { vw: videoEl.videoWidth, vh: videoEl.videoHeight, mPerPx: d / px };
+  }
+
+  function drawCalibLine() {
+    if (!calibPts.length || !videoEl.videoWidth) return;
+    const g = coverGeometry();
+    const pt = (p) => [p.nx * g.dw - g.ox, p.ny * g.dh - g.oy]; // canvas는 CSS로 좌우반전되므로 원본 방향 좌표로 그림
+    ctx.strokeStyle = '#e0a34a'; ctx.fillStyle = '#e0a34a'; ctx.lineWidth = 2;
+    calibPts.forEach(p => { const [x, y] = pt(p); ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill(); });
+    if (calibPts.length === 2) {
+      const [x1, y1] = pt(calibPts[0]), [x2, y2] = pt(calibPts[1]);
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    }
+  }
+
+  calibLineBtn.addEventListener('click', () => {
+    calibPts = [];
+    calibrating = true;
+    log('기준선 지정: 바닥에 표시한 구간의 시작점을 탭하세요.');
+  });
+
+  stageEl.addEventListener('click', (e) => {
+    if (!calibrating || !videoEl.videoWidth) return;
+    const g = coverGeometry();
+    const xd = g.rect.width - (e.clientX - g.rect.left); // 영상이 좌우반전 표시되므로 원래 방향으로 되돌림
+    const yd = e.clientY - g.rect.top;
+    calibPts.push({ nx: (xd + g.ox) / g.dw, ny: (yd + g.oy) / g.dh });
+    if (calibPts.length < 2) { log('끝점을 탭하세요.'); return; }
+    const [a, b] = calibPts;
+    const px = Math.hypot((b.nx - a.nx) * g.vw, (b.ny - a.ny) * g.vh);
+    calibPixelsInput.value = Math.round(px);
+    calibrating = false;
+    calibLineBtn.textContent = '기준선 다시 지정';
+    log(`기준선 ${Math.round(px)}px = ${calibDistanceInput.value}m 로 보정 (영상 ${g.vw}x${g.vh})`);
+  });
+
+  let lastSummary = null;
+  function showSummary(s) {
+    const deg = (v) => v == null ? '--' : v.toFixed(0) + '°';
+    const cm = (v) => v == null ? '--' : (v * 100).toFixed(0);
+    mKneeMax.textContent = `${deg(s.knee.left?.maxFlexionDeg)} / ${deg(s.knee.right?.maxFlexionDeg)}`;
+    mTilt.textContent = s.trunkTiltSdDeg == null ? '--' : `${s.trunkTiltSdDeg.toFixed(1)}° / ${s.trunkTiltMaxAbsDeg.toFixed(1)}°`;
+    mSway.textContent = s.pelvisSwayPctTorso == null ? '--' : s.pelvisSwayPctTorso.toFixed(1) + '%';
+    mSteps.textContent = s.stepCount;
+    mStep.innerHTML = `${cm(s.meanStepM)} / ${cm(s.meanStepCalibM)}<small>cm</small>`;
+    mStride.innerHTML = `${cm(s.meanStrideM)} / ${cm(s.meanStrideCalibM)}<small>cm</small>`;
+    mStepSd.innerHTML = s.stepSdM == null ? '--' : (s.stepSdM * 100).toFixed(1) + '<small>cm</small>';
+    mWalkSec.innerHTML = s.walkFilterApplied ? s.walkSec.toFixed(1) + '<small>s</small>' : '미검출';
+    mWalkDist.innerHTML = s.walkDistanceCalibM == null ? '--' : s.walkDistanceCalibM.toFixed(1) + '<small>m</small>';
+  }
+  function clearSummary() {
+    lastSummary = null;
+    [mKneeMax, mTilt, mSway, mSteps, mStep, mStride, mStepSd, mWalkSec, mWalkDist].forEach(el => el.textContent = '--');
+  }
+
   function resizeCanvas() {
     const rect = videoEl.getBoundingClientRect();
     canvasEl.width = rect.width;
@@ -330,6 +591,7 @@
       camDot.classList.add('on');
       camStatusText.textContent = `카메라 켜짐 (${facingMode === 'environment' ? '후면' : '전면'})`;
       flipCamBtn.disabled = false;
+      calibLineBtn.disabled = false;
       tugStartBtn.disabled = false;
       resetBtn.disabled = false;
       startCamBtn.textContent = '카메라 재시작';
@@ -379,6 +641,7 @@
 
     resizeCanvas();
     ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    drawCalibLine();
 
     if (results.poseLandmarks) {
       poseStatus.textContent = 'Pose: 검출됨';
@@ -390,6 +653,9 @@
         drawLandmarks(ctx, results.poseLandmarks, { color: '#e8efe9', radius: 2.5, lineWidth: 1 });
       }
 
+      const gm = frameMetrics(results.poseLandmarks, results.poseWorldLandmarks);
+      const fa = (v) => v == null ? '--' : v.toFixed(0) + '°';
+      mKneeNow.textContent = `${fa(gm.kneeL)} / ${fa(gm.kneeR)}`;
       // 카메라만 켜져 있어도(녹화 전이라도) 하체 신뢰도를 실시간으로 보여줘서
       // 촬영 구도를 잡는 단계에서 바로 확인 가능하게 함
       const liveLowerAvg = avgVisibility(results.poseLandmarks, LOWER_BODY_INDICES);
@@ -409,6 +675,7 @@
         };
         frames.push({
           t: (now - recordStartTs) / 1000,
+          ...gm,
           landmarks: results.poseLandmarks.map(p => ({ x: p.x, y: p.y, z: p.z, v: +p.visibility.toFixed(3) })),
           worldLandmarks: results.poseWorldLandmarks
             ? results.poseWorldLandmarks.map(p => ({ x: p.x, y: p.y, z: p.z }))
@@ -520,6 +787,7 @@
     mTotal.innerHTML = '--<small>s</small>';
     mFrames.textContent = '0';
     mConf.textContent = '--';
+    clearSummary();
     resetLowerBodySummary();
     startTimer();
     log('TUG 측정 시작');
@@ -534,6 +802,14 @@
     tugStartBtn.disabled = false;
     exportBtn.disabled = frames.length === 0;
     log(`TUG 측정 종료. 총 ${total.toFixed(2)}초, ${frames.length}프레임 기록됨`);
+    if (frames.length) {
+      lastSummary = computeSummary(frames, getCalibration());
+      showSummary(lastSummary);
+      log(lastSummary.walkFilterApplied
+        ? `보행 구간 ${lastSummary.walkSec}초에서 걸음 ${lastSummary.stepCount}회 검출`
+        : '보행 구간을 찾지 못해 전체 구간으로 계산함 (걸음 수에 일어서기·턴이 섞였을 수 있음)');
+      if (!getCalibration()) log('기준선 미지정: 보폭은 MediaPipe 추정치만 표시됨');
+    }
     if (frames.length > 0) {
       const lowerAvg = frames.reduce((s, f) => s + f.lowerVisAvg, 0) / frames.length;
       const lowCount = frames.filter(f => f.lowerVisAvg < LOW_CONF_THRESHOLD).length;
@@ -550,6 +826,7 @@
     mFrames.textContent = '--';
     mConf.textContent = '--';
     mFps.textContent = '--';
+    clearSummary();
     resetLowerBodySummary();
     lowerBodyBadge.textContent = '하체: --%';
     lowerBodyBadge.classList.remove('ok', 'no');
@@ -596,11 +873,14 @@
         recordedAt: new Date().toISOString(),
         calibDistanceMeters: parseFloat(calibDistanceInput.value) || null,
         calibPixels: parseFloat(calibPixelsInput.value) || null,
+        calibPoints: calibPts.length === 2 ? calibPts : null,
+        videoWidth: videoEl.videoWidth, videoHeight: videoEl.videoHeight,
         totalTimeSec: frames.length ? frames[frames.length - 1].t : 0,
         frameCount: frames.length,
         lowerBodyConfidence: lowerBodySummary,
-        note: "landmarks는 MediaPipe Pose 정규화 좌표(0~1), worldLandmarks는 미터 단위 상대좌표"
+        note: "landmarks는 MediaPipe Pose 정규화 좌표(0~1), worldLandmarks는 미터 단위 상대좌표. 프레임별 kneeL/kneeR=무릎 굴곡각(deg, 0=펴짐), trunkTilt=몸통 좌우 기울기(deg), pelvisX=골반 중점 x, ankleSep=좌우 발목 수평 간격(m)"
       },
+      summary: lastSummary,
       frames
     };
     const blob = new Blob([JSON.stringify(session, null, 2)], { type: 'application/json' });
